@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # 🎬 IMDb Episode Scraper
 
 Este projeto é um **scraper** desenvolvido em Python que coleta informações de episódios de uma série no IMDb, acessando diretamente a página de cada episódio. O script gera um arquivo SQL contendo comandos de inserção para popular um banco de dados com os dados extraídos.
@@ -70,3 +71,7 @@ VALUES ('Stranger Things', 1, 1, 'Chapter One: The Vanishing of Will Byers', '47
 Este projeto é de código aberto e pode ser utilizado livremente.
 
 
+=======
+# IMDB2SQLINSERTION
+Um script de scraping do imdb para construir comandos de inserção para popular um banco de dados do projeto: https://github.com/renangrothe/Sistema-De-Avaliacao-de-Series
+>>>>>>> 2335cfe61e3465e7879a1125e8745f2a7747333b
