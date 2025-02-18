@@ -177,7 +177,7 @@ def get_season_episodes(serie_id, season_number):
             logger.info(f"Encontrados {len(episode_items)} episódios usando o fallback 'episode-item-wrapper'.")
         
         if not episode_items:
-            return []
+            return [], soup
             
         for item in episode_items:
             try:
@@ -233,12 +233,120 @@ def get_season_episodes(serie_id, season_number):
                 logger.error(f"Erro ao processar episódio: {str(ep_error)}")
                 continue
         
-        return sorted(episodes, key=lambda x: x['num_episodio'])
+        return sorted(episodes, key=lambda x: x['num_episodio']), soup
         
     except Exception as e:
         logger.error(f"Erro ao obter episódios da temporada {season_number}: {str(e)}")
+        return [], soup
+
+def sql_escape(texto):
+    """Sanitiza texto para uso seguro em queries SQL, removendo aspas simples e caracteres não permitidos"""
+    caracteres_problematicos = {
+        "'": "",   # Remove aspas simples
+        "\"": "",  # Remove aspas duplas
+        "\\": "",  # Remove backslashes
+        "\x00": "",# Remove caractere nulo
+        "\x1a": "",# Remove caractere de substituição
+        ";": ""    # Remove ponto-e-vírgula (prevenção básica contra injection)
+    }
+
+    for char, substituto in caracteres_problematicos.items():
+        texto = texto.replace(char, substituto)
+
+    # Remove caracteres não-ASCII (opcional)
+    texto = texto.encode('ascii', 'ignore').decode('ascii')
+
+    return texto.strip()
+
+
+def get_pais_origem(serie_id):
+    """Extrai o país de origem da série"""
+    try:
+        url = f"https://www.imdb.com/title/{serie_id}/?ref_=ttep_ov"
+        response = requests.get(url, headers=HEADERS)
+        soup = BeautifulSoup(response.text, 'html.parser')
+
+        # Encontra o elemento que contém "Country of origin"
+        label = soup.find('span',
+                         class_='ipc-metadata-list-item__label',
+                         string=lambda text: text and 'Country of origin' in text)
+
+        if not label:
+            return 'N/A', soup
+
+        # Navega para o elemento pai e pega o conteúdo seguinte
+        container = label.find_parent('li', class_='ipc-metadata-list__item')
+        if container:
+            # Pega todos os países listados
+            paises = container.find_all('a', class_='ipc-metadata-list-item__list-content-item')
+            return ', '.join([p.get_text(strip=True) for p in paises]), soup
+
+        return 'N/A', soup
+
+    except Exception as e:
+        print(f"Erro ao buscar país: {str(e)}")
+        return 'N/A', soup
+
+def get_serie_synopsis(soup):
+    try:
+        # Passo 1: Encontre o container principal pela classe única
+        main_container = soup.find('section', class_='sc-70a366cc-4')
+
+        # Passo 2: Dentro dele, busque o parágrafo com data-testid
+        plot_paragraph = main_container.find('p', {'data-testid': 'plot'})
+
+        # Passo 3: Pegue o span com data-testid="plot-xl"
+        synopsis_tag = plot_paragraph.find('span', {'data-testid': 'plot-xl'})
+
+        return synopsis_tag.get_text(strip=True)
+
+    except AttributeError:
+        # Fallback para estrutura alternativa (ex: seção Storyline)
+        storyline_section = soup.find('div', class_='ipc-html-content-inner-div')
+        if storyline_section:
+            return storyline_section.get_text(strip=True).split('—')[0]
+
+        return 'Sinopse não disponível'
+
+def get_generos_serie(soup):
+    """Extrai gêneros mesmo sem encontrar a seção Storyline"""
+    try:
+        # Método 1: Busca direta por links de gêneros
+        generos = soup.find_all('a', href=lambda x: x and '/search/title/?genres=' in x)
+        if generos:
+            return list(set([g.get_text(strip=True) for g in generos]))
+
+        # Método 2: Busca por chips de gêneros
+        generos_chips = soup.find_all('span', class_='ipc-chip__text')
+        if generos_chips:
+            return list(set([chip.get_text(strip=True) for chip in generos_chips]))
+
         return []
 
+    except Exception as e:
+        logger.error(f"Erro definitivo na extração: {str(e)}")
+        return []
+
+def normalize_genres(imdb_genres_scraped, serie_nome):
+    allowed_genres = ['action', 
+                      'comedy',
+                      'drama',
+                      'sci-fi',
+                      'romance',
+                      'thriller',
+                      'horror']
+
+    mapped_genres = [g.strip().lower() for g in imdb_genres_scraped if g.strip().lower() in allowed_genres]
+
+    # Garantir que a série tenha pelo menos um gênero
+    if not mapped_genres:
+        mapped_genres = ['action']  # default 
+
+    # Gera SQL para os gêneros (evita duplicatas com set)
+    insert_values = ",\n".join(f"('{serie_nome}', '{genre}')" for genre in set(mapped_genres))
+
+    return insert_values
+    
 def main():
     """Função principal agora recebe parâmetros"""
     
@@ -254,28 +362,47 @@ def main():
         serie_id = input("ID da série (ex: tt0903747): ").strip()
         serie_nome = input("Nome da série (ex: Breaking Bad): ").strip()
     
-    output_file = f"{serie_nome}_episodes.sql" 
+    output_file = f"../scripts_insercao_gerados/{serie_nome}_episodes.sql" 
     
     
     with open(output_file, 'w', encoding='utf-8') as file:
 
-        # Gera SQL para a série
-        file.write(f"""
--- Serie: {serie_nome}
-INSERT INTO Serie (nome, sinopse, (SELECT id FROM Pais WHERE nome = 'pais_de_origem')
-VALUES ('{serie_nome}', 'sinopse_dummy', 'pais_dummy');
-""")
-
         season = 1
         while True:
             logger.info(f"Processando temporada {season}...")
-            episodes = get_season_episodes(serie_id, season)
+            episodes, main_soup = get_season_episodes(serie_id, season)
             if not episodes:
                 logger.info(f"⚠️ Temporada {season} não encontrada ou sem dados. Finalizando...")
                 break
             
             logger.info(f"✓ Temporada {season}: {len(episodes)} episódios encontrados")
             
+            # Extrair dados sobre a série e tratá-los para o SQL:
+            if season < 2:
+                synopsis = sql_escape(get_serie_synopsis(main_soup))
+                pais_de_origem, soup_title = get_pais_origem(serie_id)
+                if soup_title:
+                    generos_serie = get_generos_serie(soup_title)
+            
+            if generos_serie:    
+                insert_values_genres = normalize_genres(generos_serie, serie_nome)
+                logger.info(f"{generos_serie}")
+                
+                # Gera SQL para a série
+                file.write(f"""
+-- Arquivo de inserção de uma série e seus episódios gerado pelo script IMDb2SQLinsertion
+
+-- Serie: {serie_nome}
+
+INSERT INTO Serie (nome, sinopse, pais_id)
+VALUES ('{serie_nome}', '{synopsis}', (SELECT id FROM Pais WHERE nome = '{pais_de_origem}'));
+
+                           -- Gêneros normalizados
+INSERT INTO SerieGenero (serie_nome, genero)
+VALUES {insert_values_genres};
+""")
+
+
             # Determina o ano da temporada baseado na data de estreia do primeiro episódio
             season_year = episodes[0]['data_estreia'][:4] if episodes[0]['data_estreia'] != '1900-01-01' else None
             if not season_year:
