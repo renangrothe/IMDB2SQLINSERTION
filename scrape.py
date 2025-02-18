@@ -63,84 +63,101 @@ def parse_airdate(raw_date):
     return f"{year_match.group(0)}-01-01" if year_match else None
 
 def parse_runtime(runtime_text):
-    """Converte texto de duração para o padrão 'XXmin'"""
+    """Converte formatos como '1 hour 2 minutes' para minutos inteiros"""
     if not runtime_text:
         return None
-    runtime_text = runtime_text.strip()
-    minutes_match = re.search(r'(\d+)\s*min', runtime_text, re.IGNORECASE)
-    if minutes_match:
-        return f"{minutes_match.group(1)}"
-    hours_match = re.search(r'(\d+)h\s*(\d+)m', runtime_text, re.IGNORECASE)
-    if hours_match:
-        total_minutes = int(hours_match.group(1)) * 60 + int(hours_match.group(2))
-        return f"{total_minutes}min"
-    return runtime_text if runtime_text != 'N/A' else None
+
+    # Padronização do texto
+    text = runtime_text.lower().replace('hours', 'hour').replace('minutes', 'minute')
+    
+    # Regex para capturar horas e minutos separadamente
+    time_pattern = r'''
+        (?:(\d+)\s*hour[s]?)?    # Captura horas (ex: 1 hour)
+        (?:\s*(\d+)\s*minute[s]?)?  # Captura minutos (ex: 23 minutes)
+    '''
+    
+    match = re.search(time_pattern, text, re.VERBOSE)
+    
+    if match:
+        hours = int(match.group(1)) if match.group(1) else 0
+        minutes = int(match.group(2)) if match.group(2) else 0
+        return hours * 60 + minutes
+    
+    # Fallback para outros formatos (ex: "1h30m")
+    numbers = [int(n) for n in re.findall(r'\d+', text)]
+    if len(numbers) == 2:  # Hora e minuto
+        return numbers[0] * 60 + numbers[1]
+    elif numbers:  # Apenas minutos ou horas
+        return numbers[0] * 60 if 'hour' in text else numbers[0]
+    
+    return None
 
 def map_classificacao_imdb(imdb_rating):
-    """Converte as classificações do IMDb para o padrão especificado"""
+    """Mapeamento com limpeza mais rigorosa"""
     mapeamento = {
-        'L': 'L',
-        'TV-Y': 'L',
-        'TV-G': 'L',
-        'TV-PG': '10',
-        'TV-Y7': '10',
-        'TV-14': '14',
-        'TV-MA': '18',
-        '16': '16',  # Caso apareça direto
-        '18': '18'    # Caso apareça direto
+        'TVY7': '10',
+        'TVPG': '10',
+        'TV14': '14',  # Caso do exemplo
+        'TVMA': '18',
+        '16': '16',
+        '18': '18'
     }
     
-    # Extrai apenas números ou siglas conhecidas
-    rating_clean = re.sub(r'[^A-Z0-9]', '', imdb_rating.upper())
+    # Limpeza agressiva de caracteres especiais e espaços
+    rating_clean = re.sub(r'[^A-Z0-9]', '', imdb_rating.upper().replace('-', ''))
     
-    return mapeamento.get(rating_clean, 'L')  # Default para 'L' se não encontrar
+    return mapeamento.get(rating_clean, 'L')
 
 def get_episode_rating(soup):
-    """Extrai e converte a classificação indicativa"""
+    """Extrai classificação indicativa das duas localizações possíveis"""
     try:
-        # Encontra o elemento de duração primeiro
-        runtime_li = soup.find('li', string=re.compile(r'\d+\s*min', re.IGNORECASE))
-        
-        if runtime_li:
-            rating_li = runtime_li.find_previous_sibling('li')
-            if rating_li:
-                rating_element = rating_li.find('a', href=re.compile(r'parentalguide'))
-                if rating_element:
-                    raw_rating = rating_element.text.strip()
-                    return map_classificacao_imdb(raw_rating)
-                
-                # Fallback para texto direto
-                raw_rating = rating_li.get_text(strip=True)
-                return map_classificacao_imdb(raw_rating)
-        
-        # Fallback alternativo
-        cert_element = soup.find('a', href=re.compile(r'parentalguide'))
-        if cert_element:
-            return map_classificacao_imdb(cert_element.text.strip())
+        # Primeiro método: span na seção de storyline
+        rating_span = soup.find('span', class_='ipc-metadata-list-item__list-content-item', 
+                              string=re.compile(r'TV-[\dA-Z]+'))
+        if rating_span:
+            raw_rating = rating_span.get_text(strip=True)
+            logger.info(f"Classificação encontrada (span): {raw_rating}")
+            return map_classificacao_imdb(raw_rating)
+
+        # Segundo método: anchor na seção hero
+        rating_anchor = soup.find('a', href=re.compile(r'parentalguide'), 
+                             string=re.compile(r'TV-[\dA-Z]+'))
+        if rating_anchor:
+            raw_rating = rating_anchor.get_text(strip=True)
+            logger.info(f"Classificação encontrada (anchor): {raw_rating}")
+            return map_classificacao_imdb(raw_rating)
+
+        # Fallback para conteúdo próximo
+        parental_section = soup.find('a', href=re.compile(r'parentalguide'))
+        if parental_section:
+            nearby_text = parental_section.find_next(text=re.compile(r'TV-[\dA-Z]+'))
+            if nearby_text:
+                return map_classificacao_imdb(nearby_text.strip())
+
+        logger.warning("Classificação não encontrada nas localizações conhecidas")
+        return 'L'
         
     except Exception as e:
-        logger.error(f"Erro na classificação: {str(e)}")
-    
-    return 'L'  
+        logger.error(f"Erro na extração da classificação: {str(e)}")
+        return 'L'
 
 def get_episode_runtime(episode_url):
-    """Extrai duração e classificação indicativa"""
     try:
         response = requests.get(episode_url, headers=HEADERS)
         soup = BeautifulSoup(response.text, 'html.parser')
 
-        # Extrai duração como número inteiro
-        runtime_element = soup.find('li', string=re.compile(r'\d+\s*(min|h)', re.IGNORECASE))
-        runtime = parse_runtime(runtime_element.text) if runtime_element else None
+        # Busca na seção de Technical Specs
+        runtime_element = soup.find('li', {'data-testid': 'title-techspec_runtime'})
 
-        # Extrai classificação
-        rating = get_episode_rating(soup)
-
-        return runtime, rating
-
+        if runtime_element:
+            raw_text = ' '.join(runtime_element.stripped_strings)
+            return parse_runtime(raw_text.split('Runtime')[-1].strip()), soup  # Remove o label
+        
+        return None, soup
+        
     except Exception as e:
-        logger.error(f"Erro ao obter dados do episódio: {str(e)}")
-        return 'N/A', 'L'
+        logger.error(f"Erro ao obter runtime: {str(e)}")
+        return None, soup
 
 def get_season_episodes(serie_id, season_number):
     try:
@@ -191,16 +208,18 @@ def get_season_episodes(serie_id, season_number):
                 episode_url = None
                 for candidate in link_candidates:
                     href = candidate.get('href', '')
+
                     if '/title/tt' in href and 'ref_' in href:
-                        # Usa a versão em português (/pt/) conforme informado
-                        episode_url = f"https://www.imdb.com/pt{href.split('?')[0]}"
+                        episode_url = f"https://www.imdb.com{href.split('?')[0]}"
                         break
+
                 if not episode_url:
                     logger.warning("Link do episódio não encontrado, pulando episódio.")
                     continue
                 
-                # Obtém a duração na página individual do episódio
-                runtime, rating = get_episode_runtime(episode_url)
+                # Obtém a duração e classificação na página individual do episódio
+                runtime, parsed = get_episode_runtime(episode_url)
+                rating = get_episode_rating(parsed)
 
                 episodes.append({
                     'num_episodio': ep_num,
@@ -236,8 +255,17 @@ def main():
         serie_nome = input("Nome da série (ex: Breaking Bad): ").strip()
     
     output_file = f"{serie_nome}_episodes.sql" 
-
+    
+    
     with open(output_file, 'w', encoding='utf-8') as file:
+
+        # Gera SQL para a série
+        file.write(f"""
+-- Serie: {serie_nome}
+INSERT INTO Serie (nome, sinopse, (SELECT id FROM Pais WHERE nome = 'pais_de_origem')
+VALUES ('{serie_nome}', 'sinopse_dummy', 'pais_dummy');
+""")
+
         season = 1
         while True:
             logger.info(f"Processando temporada {season}...")
@@ -269,7 +297,7 @@ VALUES ('{serie_nome}', {season}, {season_year}, {len(episodes)});
             for ep in episodes:
                 file.write(f"""
 INSERT INTO Episodio (serie_nome, num_temporada, num_episodio, nome, duracao, data_estreia, classificacao)
-VALUES ('{serie_nome}', {season}, {ep['num_episodio']}, '{sql_escape(ep['nome'])}', '{ep['duracao'] or 'NULL'}', '{ep['data_estreia'] or 'NULL'}', '{ep['classificacao']}');
+VALUES ('{serie_nome}', {season}, {ep['num_episodio']}, '{sql_escape(ep['nome'])}', {ep['duracao'] or 'NULL'}, '{ep['data_estreia'] or 'NULL'}', '{ep['classificacao']}');
 """)
 
             season += 1
